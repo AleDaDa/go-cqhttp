@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/hex"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 type httpServer struct {
 	engine *gin.Engine
 	bot    *coolq.CQBot
+	Http *http.Server
 }
 
 type httpClient struct {
@@ -79,13 +81,23 @@ func (s *httpServer) Run(addr, authToken string, bot *coolq.CQBot) {
 
 	go func() {
 		log.Infof("CQ HTTP 服务器已启动: %v", addr)
-		err := s.engine.Run(addr)
-		if err != nil {
+		s.Http=&http.Server{
+			Addr:addr,
+			Handler:s.engine,
+		}
+		if err := s.Http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error(err)
 			log.Infof("请检查端口是否被占用.")
 			time.Sleep(time.Second * 5)
 			os.Exit(1)
 		}
+		//err := s.engine.Run(addr)
+		//if err != nil {
+		//	log.Error(err)
+		//	log.Infof("请检查端口是否被占用.")
+		//	time.Sleep(time.Second * 5)
+		//	os.Exit(1)
+		//}
 	}()
 }
 
@@ -118,7 +130,9 @@ func (c *httpClient) onBotPushEvent(m coolq.MSG) {
 			h["X-Signature"] = "sha1=" + hex.EncodeToString(mac.Sum(nil))
 		}
 		return h
-	}()).SetTimeout(time.Second * time.Duration(c.timeout)).Do()
+	}()).SetTimeout(time.Second * time.Duration(c.timeout)).F().Retry().Attempt(5).
+		WaitTime(time.Millisecond * 500).MaxWaitTime(time.Second * 5).
+		Do()
 	if err != nil {
 		log.Warnf("上报Event数据 %v 到 %v 失败: %v", m.ToJson(), c.addr, err)
 		return
@@ -354,6 +368,11 @@ func (s *httpServer) OcrImage(c *gin.Context) {
 	c.JSON(200, s.bot.CQOcrImage(img))
 }
 
+func (s *httpServer) GetWordSlices(c *gin.Context) {
+	content := getParam(c, "content")
+	c.JSON(200, s.bot.CQGetWordSlices(content))
+}
+
 func (s *httpServer) SetGroupPortrait(c *gin.Context) {
 	gid, _ := strconv.ParseInt(getParam(c, "group_id"), 10, 64)
 	file := getParam(c, "file")
@@ -518,4 +537,20 @@ var httpApi = map[string]func(s *httpServer, c *gin.Context){
 	".ocr_image": func(s *httpServer, c *gin.Context) {
 		s.OcrImage(c)
 	},
+	".get_word_slices": func(s *httpServer, c *gin.Context) {
+		s.GetWordSlices(c)
+	},
+}
+
+func (s *httpServer) ShutDown() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Http.Shutdown(ctx); err != nil {
+		log.Fatal("http Server Shutdown:", err)
+	}
+	select {
+	case <-ctx.Done():
+		log.Println("timeout of 5 seconds.")
+	}
+	log.Println("http Server exiting")
 }
