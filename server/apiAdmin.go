@@ -9,6 +9,7 @@ import (
 	"github.com/Mrs4s/MiraiGo/client"
 	"github.com/Mrs4s/go-cqhttp/coolq"
 	"github.com/Mrs4s/go-cqhttp/global"
+	"github.com/Mrs4s/go-cqhttp/qgroup"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -136,6 +137,8 @@ func (s *webServer) Dologin() {
 	global.Check(cli.ReloadGroupList())
 	log.Infof("共加载 %v 个群.", len(cli.GroupList))
 	s.bot = coolq.NewQQBot(cli, conf)
+	qRule := qgroup.CreateNewRule("def")
+	qRule.Listern(s.bot)
 	if conf.PostMessageFormat != "string" && conf.PostMessageFormat != "array" {
 		log.Warnf("post_message_format 配置错误, 将自动使用 string")
 		coolq.SetMessageFormat("string")
