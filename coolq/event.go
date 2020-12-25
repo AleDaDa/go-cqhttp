@@ -2,16 +2,17 @@ package coolq
 
 import (
 	"encoding/hex"
-	"github.com/Mrs4s/MiraiGo/binary"
-	"github.com/Mrs4s/MiraiGo/client"
-	"github.com/Mrs4s/MiraiGo/message"
-	"github.com/Mrs4s/go-cqhttp/global"
-	log "github.com/sirupsen/logrus"
 	"io/ioutil"
 	"path"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Mrs4s/MiraiGo/binary"
+	"github.com/Mrs4s/MiraiGo/client"
+	"github.com/Mrs4s/MiraiGo/message"
+	"github.com/Mrs4s/go-cqhttp/global"
+	log "github.com/sirupsen/logrus"
 )
 
 var format = "string"
@@ -31,18 +32,22 @@ func ToFormattedMessage(e []message.IMessageElement, code int64, raw ...bool) (r
 
 func (bot *CQBot) privateMessageEvent(c *client.QQClient, m *message.PrivateMessage) {
 	bot.checkMedia(m.Elements)
-	cqm := ToStringMessage(m.Elements, 0, true)
+	cqm := ToStringMessage(m.Elements, m.Sender.Uin, true)
 	if !m.Sender.IsFriend {
 		bot.oneWayMsgCache.Store(m.Sender.Uin, "")
 	}
-	log.Infof("收到好友 %v(%v) 的消息: %v", m.Sender.DisplayName(), m.Sender.Uin, cqm)
+	id := m.Id
+	if bot.db != nil {
+		id = bot.InsertPrivateMessage(m)
+	}
+	log.Infof("收到好友 %v(%v) 的消息: %v (%v)", m.Sender.DisplayName(), m.Sender.Uin, cqm, id)
 	fm := MSG{
 		"post_type":    "message",
 		"message_type": "private",
 		"sub_type":     "friend",
-		"message_id":   ToGlobalId(m.Sender.Uin, m.Id),
+		"message_id":   id,
 		"user_id":      m.Sender.Uin,
-		"message":      ToFormattedMessage(m.Elements, 0, false),
+		"message":      ToFormattedMessage(m.Elements, m.Sender.Uin, false),
 		"raw_message":  cqm,
 		"font":         0,
 		"self_id":      c.Uin,
@@ -163,13 +168,24 @@ func (bot *CQBot) tempMessageEvent(c *client.QQClient, m *message.TempMessage) {
 
 func (bot *CQBot) groupMutedEvent(c *client.QQClient, e *client.GroupMuteEvent) {
 	g := c.FindGroup(e.GroupCode)
-	if e.Time > 0 {
-		log.Infof("群 %v 内 %v 被 %v 禁言了 %v秒.",
-			formatGroupName(g), formatMemberName(g.FindMember(e.TargetUin)), formatMemberName(g.FindMember(e.OperatorUin)), e.Time)
+	if e.TargetUin == 0 {
+		if e.Time != 0 {
+			log.Infof("群 %v 被 %v 开启全员禁言.",
+				formatGroupName(g), formatMemberName(g.FindMember(e.OperatorUin)))
+		} else {
+			log.Infof("群 %v 被 %v 解除全员禁言.",
+				formatGroupName(g), formatMemberName(g.FindMember(e.OperatorUin)))
+		}
 	} else {
-		log.Infof("群 %v 内 %v 被 %v 解除禁言.",
-			formatGroupName(g), formatMemberName(g.FindMember(e.TargetUin)), formatMemberName(g.FindMember(e.OperatorUin)))
+		if e.Time > 0 {
+			log.Infof("群 %v 内 %v 被 %v 禁言了 %v 秒.",
+				formatGroupName(g), formatMemberName(g.FindMember(e.TargetUin)), formatMemberName(g.FindMember(e.OperatorUin)), e.Time)
+		} else {
+			log.Infof("群 %v 内 %v 被 %v 解除禁言.",
+				formatGroupName(g), formatMemberName(g.FindMember(e.TargetUin)), formatMemberName(g.FindMember(e.OperatorUin)))
+		}
 	}
+
 	bot.dispatchEventMessage(MSG{
 		"post_type":   "notice",
 		"duration":    e.Time,
@@ -180,10 +196,10 @@ func (bot *CQBot) groupMutedEvent(c *client.QQClient, e *client.GroupMuteEvent) 
 		"user_id":     e.TargetUin,
 		"time":        time.Now().Unix(),
 		"sub_type": func() string {
-			if e.Time > 0 {
-				return "ban"
+			if e.Time == 0 {
+				return "lift_ban"
 			}
-			return "lift_ban"
+			return "ban"
 		}(),
 	})
 }
@@ -205,7 +221,7 @@ func (bot *CQBot) groupRecallEvent(c *client.QQClient, e *client.GroupMessageRec
 	})
 }
 
-func (bot *CQBot) groupNotifyEvent(c *client.QQClient, e client.IGroupNotifyEvent) {
+func (bot *CQBot) groupNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
 	group := c.FindGroup(e.From())
 	switch notify := e.(type) {
 	case *client.GroupPokeNotifyEvent:
@@ -264,17 +280,59 @@ func (bot *CQBot) groupNotifyEvent(c *client.QQClient, e client.IGroupNotifyEven
 	}
 }
 
+func (bot *CQBot) friendNotifyEvent(c *client.QQClient, e client.INotifyEvent) {
+	friend := c.FindFriend(e.From())
+	switch notify := e.(type) {
+	case *client.FriendPokeNotifyEvent:
+		log.Infof("好友 %v 戳了戳你.", friend.Nickname)
+		bot.dispatchEventMessage(MSG{
+			"post_type":   "notice",
+			"notice_type": "notify",
+			"sub_type":    "poke",
+			"self_id":     c.Uin,
+			"user_id":     notify.Sender,
+			"sender_id":   notify.Sender,
+			"target_id":   notify.Receiver,
+			"time":        time.Now().Unix(),
+		})
+	}
+}
+
 func (bot *CQBot) friendRecallEvent(c *client.QQClient, e *client.FriendMessageRecalledEvent) {
 	f := c.FindFriend(e.FriendUin)
 	gid := ToGlobalId(e.FriendUin, e.MessageId)
-	log.Infof("好友 %v(%v) 撤回了消息: %v", f.Nickname, f.Uin, gid)
+	if f != nil {
+		log.Infof("好友 %v(%v) 撤回了消息: %v", f.Nickname, f.Uin, gid)
+	} else {
+		log.Infof("好友 %v 撤回了消息: %v", e.FriendUin, gid)
+	}
 	bot.dispatchEventMessage(MSG{
 		"post_type":   "notice",
 		"notice_type": "friend_recall",
 		"self_id":     c.Uin,
-		"user_id":     f.Uin,
+		"user_id":     e.FriendUin,
 		"time":        e.Time,
 		"message_id":  gid,
+	})
+}
+
+func (bot *CQBot) offlineFileEvent(c *client.QQClient, e *client.OfflineFileEvent) {
+	f := c.FindFriend(e.Sender)
+	if f == nil {
+		return
+	}
+	log.Infof("好友 %v(%v) 发送了离线文件 %v", f.Nickname, f.Uin, e.FileName)
+	bot.dispatchEventMessage(MSG{
+		"post_type":   "notice",
+		"notice_type": "offline_file",
+		"user_id":     e.Sender,
+		"file": MSG{
+			"name": e.FileName,
+			"size": e.FileSize,
+			"url":  e.DownloadUrl,
+		},
+		"self_id": c.Uin,
+		"time":    time.Now().Unix(),
 	})
 }
 
@@ -305,6 +363,20 @@ func (bot *CQBot) memberPermissionChangedEvent(c *client.QQClient, e *client.Mem
 		"sub_type":    st,
 		"group_id":    e.Group.Code,
 		"user_id":     e.Member.Uin,
+		"time":        time.Now().Unix(),
+		"self_id":     c.Uin,
+	})
+}
+
+func (bot *CQBot) memberCardUpdatedEvent(c *client.QQClient, e *client.MemberCardUpdatedEvent) {
+	log.Infof("群 %v 的 %v 更新了名片 %v -> %v", formatGroupName(e.Group), formatMemberName(e.Member), e.OldCard, e.Member.CardName)
+	bot.dispatchEventMessage(MSG{
+		"post_type":   "notice",
+		"notice_type": "group_card",
+		"group_id":    e.Group.Code,
+		"user_id":     e.Member.Uin,
+		"card_new":    e.Member.CardName,
+		"card_old":    e.OldCard,
 		"time":        time.Now().Unix(),
 		"self_id":     c.Uin,
 	})
@@ -354,7 +426,6 @@ func (bot *CQBot) friendAddedEvent(c *client.QQClient, e *client.NewFriendEvent)
 func (bot *CQBot) groupInvitedEvent(c *client.QQClient, e *client.GroupInvitedRequest) {
 	log.Infof("收到来自群 %v(%v) 内用户 %v(%v) 的加群邀请.", e.GroupName, e.GroupCode, e.InvitorNick, e.InvitorUin)
 	flag := strconv.FormatInt(e.RequestId, 10)
-	bot.invitedReqCache.Store(flag, e)
 	bot.dispatchEventMessage(MSG{
 		"post_type":    "request",
 		"request_type": "group",
@@ -371,7 +442,6 @@ func (bot *CQBot) groupInvitedEvent(c *client.QQClient, e *client.GroupInvitedRe
 func (bot *CQBot) groupJoinReqEvent(c *client.QQClient, e *client.UserJoinGroupRequest) {
 	log.Infof("群 %v(%v) 收到来自用户 %v(%v) 的加群请求.", e.GroupName, e.GroupCode, e.RequesterNick, e.RequesterUin)
 	flag := strconv.FormatInt(e.RequestId, 10)
-	bot.joinReqCache.Store(flag, e)
 	bot.dispatchEventMessage(MSG{
 		"post_type":    "request",
 		"request_type": "group",
@@ -435,6 +505,48 @@ func (bot *CQBot) checkMedia(e []message.IMessageElement) {
 					w.WriteUInt32(uint32(i.Size))
 					w.WriteString(i.Filename)
 					w.WriteString(i.Url)
+				}), 0644)
+			}
+			i.Filename = filename
+		case *message.GroupImageElement:
+			filename := hex.EncodeToString(i.Md5) + ".image"
+			if !global.PathExists(path.Join(global.IMAGE_PATH, filename)) {
+				_ = ioutil.WriteFile(path.Join(global.IMAGE_PATH, filename), binary.NewWriterF(func(w *binary.Writer) {
+					w.Write(i.Md5)
+					w.WriteUInt32(uint32(i.Size))
+					w.WriteString(filename)
+					w.WriteString(i.Url)
+				}), 0644)
+			}
+		case *message.FriendImageElement:
+			filename := hex.EncodeToString(i.Md5) + ".image"
+			if !global.PathExists(path.Join(global.IMAGE_PATH, filename)) {
+				_ = ioutil.WriteFile(path.Join(global.IMAGE_PATH, filename), binary.NewWriterF(func(w *binary.Writer) {
+					w.Write(i.Md5)
+					w.WriteUInt32(uint32(0)) // 发送时会调用url, 大概没事
+					w.WriteString(filename)
+					w.WriteString(i.Url)
+				}), 0644)
+			}
+		case *message.GroupFlashImgElement:
+			filename := hex.EncodeToString(i.Md5) + ".image"
+			if !global.PathExists(path.Join(global.IMAGE_PATH, filename)) {
+				_ = ioutil.WriteFile(path.Join(global.IMAGE_PATH, filename), binary.NewWriterF(func(w *binary.Writer) {
+					w.Write(i.Md5)
+					w.WriteUInt32(uint32(i.Size))
+					w.WriteString(i.Filename)
+					w.WriteString("")
+				}), 0644)
+			}
+			i.Filename = filename
+		case *message.FriendFlashImgElement:
+			filename := hex.EncodeToString(i.Md5) + ".image"
+			if !global.PathExists(path.Join(global.IMAGE_PATH, filename)) {
+				_ = ioutil.WriteFile(path.Join(global.IMAGE_PATH, filename), binary.NewWriterF(func(w *binary.Writer) {
+					w.Write(i.Md5)
+					w.WriteUInt32(uint32(i.Size))
+					w.WriteString(i.Filename)
+					w.WriteString("")
 				}), 0644)
 			}
 			i.Filename = filename

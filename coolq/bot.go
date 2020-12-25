@@ -3,33 +3,34 @@ package coolq
 import (
 	"bytes"
 	"encoding/gob"
-	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"path"
+	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/syndtr/goleveldb/leveldb"
 
 	"github.com/Mrs4s/MiraiGo/binary"
 	"github.com/Mrs4s/MiraiGo/client"
 	"github.com/Mrs4s/MiraiGo/message"
 	"github.com/Mrs4s/go-cqhttp/global"
 
+	jsoniter "github.com/json-iterator/go"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/xujiajun/nutsdb"
 )
+
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 type CQBot struct {
 	Client *client.QQClient
 
-	events          []func(MSG)
-	db              *nutsdb.DB
-	friendReqCache  sync.Map
-	invitedReqCache sync.Map
-	joinReqCache    sync.Map
-	tempMsgCache    sync.Map
-	oneWayMsgCache  sync.Map
+	events         []func(MSG)
+	db             *leveldb.DB
+	friendReqCache sync.Map
+	tempMsgCache   sync.Map
+	oneWayMsgCache sync.Map
 }
 
 type MSG map[string]interface{}
@@ -41,12 +42,10 @@ func NewQQBot(cli *client.QQClient, conf *global.JsonConfig) *CQBot {
 		Client: cli,
 	}
 	if conf.EnableDB {
-		opt := nutsdb.DefaultOptions
-		opt.Dir = path.Join("data", "db")
-		opt.EntryIdxMode = nutsdb.HintBPTSparseIdxMode
-		db, err := nutsdb.Open(opt)
+		p := path.Join("data", "leveldb")
+		db, err := leveldb.OpenFile(p, nil)
 		if err != nil {
-			log.Fatalf("打开数据库失败, 如果频繁遇到此问题请清理 data/db 文件夹或关闭数据库功能。")
+			log.Fatalf("打开数据库失败, 如果频繁遇到此问题请清理 data/leveldb 文件夹或关闭数据库功能。")
 		}
 		bot.db = db
 		gob.Register(message.Sender{})
@@ -60,12 +59,15 @@ func NewQQBot(cli *client.QQClient, conf *global.JsonConfig) *CQBot {
 	bot.Client.OnGroupMuted(bot.groupMutedEvent)
 	bot.Client.OnGroupMessageRecalled(bot.groupRecallEvent)
 	bot.Client.OnGroupNotify(bot.groupNotifyEvent)
+	bot.Client.OnFriendNotify(bot.friendNotifyEvent)
 	bot.Client.OnFriendMessageRecalled(bot.friendRecallEvent)
+	bot.Client.OnReceivedOfflineFile(bot.offlineFileEvent)
 	bot.Client.OnJoinGroup(bot.joinGroupEvent)
 	bot.Client.OnLeaveGroup(bot.leaveGroupEvent)
 	bot.Client.OnGroupMemberJoined(bot.memberJoinEvent)
 	bot.Client.OnGroupMemberLeaved(bot.memberLeaveEvent)
 	bot.Client.OnGroupMemberPermissionChanged(bot.memberPermissionChangedEvent)
+	bot.Client.OnGroupMemberCardUpdated(bot.memberCardUpdatedEvent)
 	bot.Client.OnNewFriendRequest(bot.friendRequestEvent)
 	bot.Client.OnNewFriendAdded(bot.friendAddedEvent)
 	bot.Client.OnGroupInvited(bot.groupInvitedEvent)
@@ -86,7 +88,7 @@ func NewQQBot(cli *client.QQClient, conf *global.JsonConfig) *CQBot {
 				"self_id":         bot.Client.Uin,
 				"post_type":       "meta_event",
 				"meta_event_type": "heartbeat",
-				"status":          nil,
+				"status":          bot.CQGetStatus()["data"],
 				"interval":        1000 * i,
 			})
 		}
@@ -98,20 +100,17 @@ func (bot *CQBot) OnEventPush(f func(m MSG)) {
 	bot.events = append(bot.events, f)
 }
 
-func (bot *CQBot) GetGroupMessage(mid int32) MSG {
+func (bot *CQBot) GetMessage(mid int32) MSG {
 	if bot.db != nil {
 		m := MSG{}
-		err := bot.db.View(func(tx *nutsdb.Tx) error {
-			e, err := tx.Get("group-messages", binary.ToBytes(mid))
-			if err != nil {
-				return err
-			}
-			buff := new(bytes.Buffer)
-			buff.Write(binary.GZipUncompress(e.Value))
-			return gob.NewDecoder(buff).Decode(&m)
-		})
+		data, err := bot.db.Get(binary.ToBytes(mid), nil)
 		if err == nil {
-			return m
+			buff := new(bytes.Buffer)
+			buff.Write(binary.GZipUncompress(data))
+			err = gob.NewDecoder(buff).Decode(&m)
+			if err == nil {
+				return m
+			}
 		}
 		log.Warnf("获取信息时出现错误: %v id: %v", err, mid)
 	}
@@ -151,13 +150,85 @@ func (bot *CQBot) SendGroupMessage(groupId int64, m *message.SendingMessage) int
 			bot.Client.SendGroupGift(uint64(groupId), uint64(i.Target), i.GiftId)
 			return 0
 		}
+		if i, ok := elem.(*QQMusicElement); ok {
+			var msgStyle uint32 = 4
+			if i.MusicUrl == "" {
+				msgStyle = 0 // fix vip song
+			}
+			ret, err := bot.Client.SendGroupRichMessage(groupId, 100497308, 1, msgStyle, client.RichClientInfo{
+				Platform:    1,
+				SdkVersion:  "0.0.0",
+				PackageName: "com.tencent.qqmusic",
+				Signature:   "cbd27cd7c861227d013a25b2d10f0799",
+			}, &message.RichMessage{
+				Title:      i.Title,
+				Summary:    i.Summary,
+				Url:        i.Url,
+				PictureUrl: i.PictureUrl,
+				MusicUrl:   i.MusicUrl,
+			})
+			if err != nil {
+				log.Warnf("警告: 群 %v 富文本消息发送失败: %v", groupId, err)
+				return -1
+			}
+			return bot.InsertGroupMessage(ret)
+		}
+		if i, ok := elem.(*CloudMusicElement); ok {
+			ret, err := bot.Client.SendGroupRichMessage(groupId, 100495085, 1, 4, client.RichClientInfo{
+				Platform:    1,
+				SdkVersion:  "0.0.0",
+				PackageName: "com.netease.cloudmusic",
+				Signature:   "da6b069da1e2982db3e386233f68d76d",
+			}, &message.RichMessage{
+				Title:      i.Title,
+				Summary:    i.Summary,
+				Url:        i.Url,
+				PictureUrl: i.PictureUrl,
+				MusicUrl:   i.MusicUrl,
+			})
+			if err != nil {
+				log.Warnf("警告: 群 %v 富文本消息发送失败: %v", groupId, err)
+				return -1
+			}
+			return bot.InsertGroupMessage(ret)
+		}
+		if i, ok := elem.(*MiguMusicElement); ok {
+			ret, err := bot.Client.SendGroupRichMessage(groupId, 1101053067, 1, 4, client.RichClientInfo{
+				Platform:    1,
+				SdkVersion:  "0.0.0",
+				PackageName: "cmccwm.mobilemusic",
+				Signature:   "6cdc72a439cef99a3418d2a78aa28c73",
+			}, &message.RichMessage{
+				Title:      i.Title,
+				Summary:    i.Summary,
+				Url:        i.Url,
+				PictureUrl: i.PictureUrl,
+				MusicUrl:   i.MusicUrl,
+			})
+			if err != nil {
+				log.Warnf("警告: 群 %v 富文本消息发送失败: %v", groupId, err)
+				return -1
+			}
+			return bot.InsertGroupMessage(ret)
+		}
 		newElem = append(newElem, elem)
 	}
+	if len(newElem) == 0 {
+		log.Warnf("群消息发送失败: 消息为空.")
+		return -1
+	}
 	m.Elements = newElem
+	bot.checkMedia(newElem)
 	ret := bot.Client.SendGroupMessage(groupId, m, ForceFragmented)
 	if ret == nil || ret.Id == -1 {
 		log.Warnf("群消息发送失败: 账号可能被风控.")
-		return -1
+		if !ForceFragmented {
+			log.Warnf("将尝试分片发送...")
+			ret = bot.Client.SendGroupMessage(groupId, m, true)
+		}
+		if ret == nil || ret.Id == -1 {
+			return -1
+		}
 	}
 	return bot.InsertGroupMessage(ret)
 }
@@ -174,30 +245,97 @@ func (bot *CQBot) SendPrivateMessage(target int64, m *message.SendingMessage) in
 			newElem = append(newElem, fm)
 			continue
 		}
+		if i, ok := elem.(*PokeElement); ok {
+			bot.Client.SendFriendPoke(i.Target)
+			return 0
+		}
+		if i, ok := elem.(*message.VoiceElement); ok {
+			fv, err := bot.Client.UploadPrivatePtt(target, i.Data)
+			if err != nil {
+				log.Warnf("警告: 好友 %v 消息语音上传失败: %v", target, err)
+				continue
+			}
+			newElem = append(newElem, fv)
+			continue
+		}
+		if i, ok := elem.(*QQMusicElement); ok {
+			var msgStyle uint32 = 4
+			if i.MusicUrl == "" {
+				msgStyle = 0 // fix vip song
+			}
+			bot.Client.SendFriendRichMessage(target, 100497308, 1, msgStyle, client.RichClientInfo{
+				Platform:    1,
+				SdkVersion:  "0.0.0",
+				PackageName: "com.tencent.qqmusic",
+				Signature:   "cbd27cd7c861227d013a25b2d10f0799",
+			}, &message.RichMessage{
+				Title:      i.Title,
+				Summary:    i.Summary,
+				Url:        i.Url,
+				PictureUrl: i.PictureUrl,
+				MusicUrl:   i.MusicUrl,
+			})
+			return 0
+		}
+		if i, ok := elem.(*CloudMusicElement); ok {
+			bot.Client.SendFriendRichMessage(target, 100495085, 1, 4, client.RichClientInfo{
+				Platform:    1,
+				SdkVersion:  "0.0.0",
+				PackageName: "com.netease.cloudmusic",
+				Signature:   "da6b069da1e2982db3e386233f68d76d",
+			}, &message.RichMessage{
+				Title:      i.Title,
+				Summary:    i.Summary,
+				Url:        i.Url,
+				PictureUrl: i.PictureUrl,
+				MusicUrl:   i.MusicUrl,
+			})
+			return 0
+		}
+		if i, ok := elem.(*MiguMusicElement); ok {
+			bot.Client.SendFriendRichMessage(target, 1101053067, 1, 4, client.RichClientInfo{
+				Platform:    1,
+				SdkVersion:  "0.0.0",
+				PackageName: "cmccwm.mobilemusic",
+				Signature:   "6cdc72a439cef99a3418d2a78aa28c73",
+			}, &message.RichMessage{
+				Title:      i.Title,
+				Summary:    i.Summary,
+				Url:        i.Url,
+				PictureUrl: i.PictureUrl,
+				MusicUrl:   i.MusicUrl,
+			})
+			return 0
+		}
 		newElem = append(newElem, elem)
 	}
+	if len(newElem) == 0 {
+		log.Warnf("好友消息发送失败: 消息为空.")
+		return -1
+	}
 	m.Elements = newElem
+	bot.checkMedia(newElem)
 	var id int32 = -1
-	if bot.Client.FindFriend(target) != nil {
+	if bot.Client.FindFriend(target) != nil { // 双向好友
 		msg := bot.Client.SendPrivateMessage(target, m)
 		if msg != nil {
-			id = msg.Id
+			id = bot.InsertPrivateMessage(msg)
 		}
-	} else if code, ok := bot.tempMsgCache.Load(target); ok {
+	} else if code, ok := bot.tempMsgCache.Load(target); ok { // 临时会话
 		msg := bot.Client.SendTempMessage(code.(int64), target, m)
 		if msg != nil {
 			id = msg.Id
 		}
-	} else if _, ok := bot.oneWayMsgCache.Load(target); ok {
+	} else if _, ok := bot.oneWayMsgCache.Load(target); ok { // 单向好友
 		msg := bot.Client.SendPrivateMessage(target, m)
 		if msg != nil {
-			id = msg.Id
+			id = bot.InsertPrivateMessage(msg)
 		}
 	}
 	if id == -1 {
 		return -1
 	}
-	return ToGlobalId(target, id)
+	return id
 }
 
 func (bot *CQBot) InsertGroupMessage(m *message.GroupMessage) int32 {
@@ -212,14 +350,36 @@ func (bot *CQBot) InsertGroupMessage(m *message.GroupMessage) int32 {
 	}
 	id := ToGlobalId(m.GroupCode, m.Id)
 	if bot.db != nil {
-		err := bot.db.Update(func(tx *nutsdb.Tx) error {
-			buf := new(bytes.Buffer)
-			if err := gob.NewEncoder(buf).Encode(val); err != nil {
-				return err
-			}
-			return tx.Put("group-messages", binary.ToBytes(id), binary.GZipCompress(buf.Bytes()), 0)
-		})
-		if err != nil {
+		buf := new(bytes.Buffer)
+		if err := gob.NewEncoder(buf).Encode(val); err != nil {
+			log.Warnf("记录聊天数据时出现错误: %v", err)
+			return -1
+		}
+		if err := bot.db.Put(binary.ToBytes(id), binary.GZipCompress(buf.Bytes()), nil); err != nil {
+			log.Warnf("记录聊天数据时出现错误: %v", err)
+			return -1
+		}
+	}
+	return id
+}
+
+func (bot *CQBot) InsertPrivateMessage(m *message.PrivateMessage) int32 {
+	val := MSG{
+		"message-id":  m.Id,
+		"internal-id": m.InternalId,
+		"target":      m.Target,
+		"sender":      m.Sender,
+		"time":        m.Time,
+		"message":     ToStringMessage(m.Elements, m.Sender.Uin, true),
+	}
+	id := ToGlobalId(m.Sender.Uin, m.Id)
+	if bot.db != nil {
+		buf := new(bytes.Buffer)
+		if err := gob.NewEncoder(buf).Encode(val); err != nil {
+			log.Warnf("记录聊天数据时出现错误: %v", err)
+			return -1
+		}
+		if err := bot.db.Put(binary.ToBytes(id), binary.GZipCompress(buf.Bytes()), nil); err != nil {
 			log.Warnf("记录聊天数据时出现错误: %v", err)
 			return -1
 		}
@@ -238,22 +398,24 @@ func (bot *CQBot) Release() {
 }
 
 func (bot *CQBot) dispatchEventMessage(m MSG) {
-	payload := gjson.Parse(m.ToJson())
-	filter := global.EventFilter
-	if filter != nil && (*filter).Eval(payload) == false {
+	if global.EventFilter != nil && global.EventFilter.Eval(global.MSG(m)) == false {
 		log.Debug("Event filtered!")
 		return
 	}
 	for _, f := range bot.events {
-		fn := f
-		go func() {
+		go func(fn func(MSG)) {
+			defer func() {
+				if pan := recover(); pan != nil {
+					log.Warnf("处理事件 %v 时出现错误: %v \n%s", m, pan, debug.Stack())
+				}
+			}()
 			start := time.Now()
 			fn(m)
 			end := time.Now()
 			if end.Sub(start) > time.Second*5 {
 				log.Debugf("警告: 事件处理耗时超过 5 秒 (%v), 请检查应用是否有堵塞.", end.Sub(start))
 			}
-		}()
+		}(f)
 	}
 }
 
