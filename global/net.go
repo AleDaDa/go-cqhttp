@@ -4,11 +4,38 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
-	"github.com/tidwall/gjson"
 	"io/ioutil"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
+
+	"github.com/tidwall/gjson"
 )
+
+var client = &http.Client{
+	Timeout: time.Second * 15,
+	Transport: &http.Transport{
+		Proxy: func(request *http.Request) (u *url.URL, e error) {
+			if Proxy == "" {
+				return http.ProxyFromEnvironment(request)
+			}
+			return url.Parse(Proxy)
+		},
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
+var Proxy string
 
 func GetBytes(url string) ([]byte, error) {
 	req, err := http.NewRequest("GET", url, nil)
@@ -16,7 +43,7 @@ func GetBytes(url string) ([]byte, error) {
 		return nil, err
 	}
 	req.Header["User-Agent"] = []string{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.116 Safari/537.36 Edg/83.0.478.61"}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

@@ -4,28 +4,34 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"github.com/Mrs4s/MiraiGo/client"
-	"github.com/Mrs4s/go-cqhttp/coolq"
-	"github.com/Mrs4s/go-cqhttp/global"
-	"github.com/Mrs4s/go-cqhttp/qgroup"
-	"github.com/gin-gonic/gin"
-	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/yinghau76/go-ascii-art"
+	"github.com/gin-contrib/pprof"
 	"image"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Mrs4s/MiraiGo/client"
+	"github.com/Mrs4s/go-cqhttp/coolq"
+	"github.com/Mrs4s/go-cqhttp/global"
+	"github.com/gin-gonic/gin"
+	jsoniter "github.com/json-iterator/go"
+	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
+	asciiart "github.com/yinghau76/go-ascii-art"
 )
+
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 var WebInput = make(chan string, 1) //长度1，用于阻塞
 
 var Console = make(chan os.Signal, 1)
+
+var Restart = make(chan struct{}, 1)
 
 var JsonConfig *global.JsonConfig
 
@@ -41,16 +47,17 @@ var WebServer = &webServer{}
 
 // admin 子站的 路由映射
 var HttpuriAdmin = map[string]func(s *webServer, c *gin.Context){
-	"do_restart":        AdminDoRestart,       //热重启
-	"get_web_write":     AdminWebWrite,        //获取是否验证码输入
-	"do_web_write":      AdminDoWebWrite,      //web上进行输入操作
-	"do_restart_docker": AdminDoRestartDocker, //直接停止（依赖supervisord/docker）重新拉起
-	"do_config_base":    AdminDoConfigBase,    //修改config.json中的基础部分
-	"do_config_http":    AdminDoConfigHttp,    //修改config.json的http部分
-	"do_config_ws":      AdminDoConfigWs,      //修改config.json的正向ws部分
-	"do_config_reverse": AdminDoConfigReverse, //修改config.json 中的反向ws部分
-	"do_config_json":    AdminDoConfigJson,    //直接修改 config.json配置
-	"get_config_json":   AdminDoConfigJson,    //拉取 当前的config.json配置
+	"do_restart":         AdminDoRestart,       //热重启
+	"do_process_restart": AdminProcessRestart,  //进程重启
+	"get_web_write":      AdminWebWrite,        //获取是否验证码输入
+	"do_web_write":       AdminDoWebWrite,      //web上进行输入操作
+	"do_restart_docker":  AdminDoRestartDocker, //直接停止（依赖supervisord/docker）重新拉起
+	"do_config_base":     AdminDoConfigBase,    //修改config.json中的基础部分
+	"do_config_http":     AdminDoConfigHttp,    //修改config.json的http部分
+	"do_config_ws":       AdminDoConfigWs,      //修改config.json的正向ws部分
+	"do_config_reverse":  AdminDoConfigReverse, //修改config.json 中的反向ws部分
+	"do_config_json":     AdminDoConfigJson,    //直接修改 config.json配置
+	"get_config_json":    AdminGetConfigJson,   //拉取 当前的config.json配置
 }
 
 func Failed(code int, msg string) coolq.MSG {
@@ -70,12 +77,28 @@ func (s *webServer) Run(addr string, cli *client.QQClient) *coolq.CQBot {
 	s.engine.Any("/admin/:action", s.admin)
 
 	go func() {
-		log.Infof("Admin API 服务器已启动: %v", addr)
-		err := s.engine.Run(addr)
-		if err != nil {
-			log.Error(err)
-			log.Infof("请检查端口是否被占用.")
-			time.Sleep(time.Second * 5)
+		//开启端口监听
+		if s.Conf.WebUi != nil && s.Conf.WebUi.Enabled {
+			if Debug {
+				pprof.Register(s.engine)
+				log.Debugf("pprof 性能分析服务已启动在 http://%v/debug/pprof, 如果有任何性能问题请下载报告并提交给开发者", addr)
+				time.Sleep(time.Second * 3)
+			}
+			log.Infof("Admin API 服务器已启动: %v", addr)
+			err := s.engine.Run(addr)
+			if err != nil {
+				log.Error(err)
+				log.Infof("请检查端口是否被占用.")
+				c := make(chan os.Signal, 1)
+				signal.Notify(c, os.Interrupt, os.Kill)
+				<-c
+				os.Exit(1)
+			}
+		} else {
+			//关闭端口监听
+			c := make(chan os.Signal, 1)
+			signal.Notify(c, os.Interrupt, os.Kill)
+			<-c
 			os.Exit(1)
 		}
 	}()
@@ -87,42 +110,108 @@ func (s *webServer) Run(addr string, cli *client.QQClient) *coolq.CQBot {
 
 func (s *webServer) Dologin() {
 	s.Console = bufio.NewReader(os.Stdin)
+	readLine := func() (str string) {
+		str, _ = s.Console.ReadString('\n')
+		return
+	}
 	conf := GetConf()
 	cli := s.Cli
+	cli.AllowSlider = true
 	rsp, err := cli.Login()
+	count := 0
 	for {
 		global.Check(err)
 		var text string
 		if !rsp.Success {
 			switch rsp.Error {
+			case client.SliderNeededError:
+				if client.SystemDeviceInfo.Protocol == client.AndroidPhone {
+					log.Warnf("警告: Android Phone 强制要求暂不支持的滑条验证码, 请开启设备锁或切换到Watch协议验证通过后再使用.")
+					log.Infof("按 Enter 继续....")
+					readLine()
+					os.Exit(0)
+				}
+				cli.AllowSlider = false
+				cli.Disconnect()
+				rsp, err = cli.Login()
+				continue
 			case client.NeedCaptcha:
 				_ = ioutil.WriteFile("captcha.jpg", rsp.CaptchaImage, 0644)
 				img, _, _ := image.Decode(bytes.NewReader(rsp.CaptchaImage))
 				fmt.Println(asciiart.New("image", img).Art)
-				if conf.WebUi.WebInput {
-					log.Warn("请输入验证码 (captcha.jpg)： (http://127.0.0.1/admin/web_write 输入)")
+				if conf.WebUi != nil && conf.WebUi.WebInput {
+					log.Warnf("请输入验证码 (captcha.jpg)： (http://%s:%d/admin/do_web_write 输入)", conf.WebUi.Host, conf.WebUi.WebUiPort)
 					text = <-WebInput
 				} else {
 					log.Warn("请输入验证码 (captcha.jpg)： (Enter 提交)")
-					text, _ = s.Console.ReadString('\n')
+					text = readLine()
 				}
 				rsp, err = cli.SubmitCaptcha(strings.ReplaceAll(text, "\n", ""), rsp.CaptchaSign)
 				global.DelFile("captcha.jpg")
 				continue
+			case client.SMSNeededError:
+				log.Warnf("账号已开启设备锁, 按下 Enter 向手机 %v 发送短信验证码.", rsp.SMSPhone)
+				readLine()
+				if !cli.RequestSMS() {
+					log.Warnf("发送验证码失败，可能是请求过于频繁.")
+					time.Sleep(time.Second * 5)
+					os.Exit(0)
+				}
+				log.Warn("请输入短信验证码： (Enter 提交)")
+				text = readLine()
+				rsp, err = cli.SubmitSMS(strings.ReplaceAll(strings.ReplaceAll(text, "\n", ""), "\r", ""))
+				continue
+			case client.SMSOrVerifyNeededError:
+				log.Warnf("账号已开启设备锁，请选择验证方式:")
+				log.Warnf("1. 向手机 %v 发送短信验证码", rsp.SMSPhone)
+				log.Warnf("2. 使用手机QQ扫码验证.")
+				log.Warn("请输入(1 - 2): ")
+				text = readLine()
+				if strings.Contains(text, "1") {
+					if !cli.RequestSMS() {
+						log.Warnf("发送验证码失败，可能是请求过于频繁.")
+						time.Sleep(time.Second * 5)
+						os.Exit(0)
+					}
+					log.Warn("请输入短信验证码： (Enter 提交)")
+					text = readLine()
+					rsp, err = cli.SubmitSMS(strings.ReplaceAll(strings.ReplaceAll(text, "\n", ""), "\r", ""))
+					continue
+				}
+				log.Warnf("请前往 -> %v <- 验证并重启Bot.", rsp.VerifyUrl)
+				log.Infof("按 Enter 继续....")
+				readLine()
+				os.Exit(0)
+				return
 			case client.UnsafeDeviceError:
 				log.Warnf("账号已开启设备锁，请前往 -> %v <- 验证并重启Bot.", rsp.VerifyUrl)
-				if conf.WebUi.WebInput {
-					log.Infof(" (http://127.0.0.1/admin/web_write 确认后继续)....")
+				if conf.WebUi != nil && conf.WebUi.WebInput {
+					log.Infof(" (http://%s:%d/admin/do_web_write 确认后继续)....", conf.WebUi.Host, conf.WebUi.WebUiPort)
 					text = <-WebInput
 				} else {
-					log.Infof(" 按 Enter 继续....")
-					_, _ = s.Console.ReadString('\n')
+					log.Infof("按 Enter 继续....")
+					readLine()
 				}
 				log.Info(text)
 				os.Exit(0)
 				return
 			case client.OtherLoginError, client.UnknownLoginError:
-				log.Fatalf("登录失败: %v", rsp.ErrorMessage)
+				msg := rsp.ErrorMessage
+				if strings.Contains(msg, "版本") {
+					msg = "密码错误或账号被冻结"
+				}
+				if strings.Contains(msg, "上网环境") && count < 5 {
+					cli.Disconnect()
+					rsp, err = cli.Login()
+					count++
+					log.Warnf("错误: 当前上网环境异常. 将更换服务器并重试. 如果频繁遇到此问题请打开设备锁.")
+					time.Sleep(time.Second)
+					continue
+				}
+				log.Warnf("登录失败: %v", msg)
+				log.Infof("按 Enter 继续....")
+				readLine()
+				os.Exit(0)
 				return
 			}
 		}
@@ -150,7 +239,9 @@ func (s *webServer) Dologin() {
 	}
 	log.Info("正在加载事件过滤器.")
 	global.BootFilter()
+	global.InitCodec()
 	coolq.IgnoreInvalidCQCode = conf.IgnoreInvalidCQCode
+	coolq.SplitUrl = conf.FixUrl
 	coolq.ForceFragmented = conf.ForceFragmented
 	log.Info("资源初始化完成, 开始处理信息.")
 	log.Info("アトリは、高性能ですから!")
@@ -162,8 +253,7 @@ func (s *webServer) Dologin() {
 					log.Warn("Bot已登录")
 					return
 				}
-				if conf.ReLogin.MaxReloginTimes == 0 {
-				} else if times > conf.ReLogin.MaxReloginTimes {
+				if times > conf.ReLogin.MaxReloginTimes && conf.ReLogin.MaxReloginTimes != 0 {
 					break
 				}
 				log.Warnf("Bot已离线 (%v)，将在 %v 秒后尝试重连. 重连次数：%v",
@@ -173,6 +263,7 @@ func (s *webServer) Dologin() {
 				rsp, err := cli.Login()
 				if err != nil {
 					log.Errorf("重连失败: %v", err)
+					cli.Disconnect()
 					continue
 				}
 				if !rsp.Success {
@@ -183,6 +274,7 @@ func (s *webServer) Dologin() {
 						log.Fatalf("重连失败: 设备锁")
 					default:
 						log.Errorf("重连失败: %v", rsp.ErrorMessage)
+						cli.Disconnect()
 						continue
 					}
 				}
@@ -211,7 +303,7 @@ func GetConf() *global.JsonConfig {
 	if JsonConfig != nil {
 		return JsonConfig
 	}
-	conf := global.Load("config.json")
+	conf := global.Load("config.hjson")
 	return conf
 }
 
@@ -228,6 +320,10 @@ func AuthMiddleWare() gin.HandlerFunc {
 		// 放行所有OPTIONS方法，因为有的模板是要请求两次的
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
+		}
+		if strings.Contains(c.Request.URL.Path, "debug") {
+			c.Next()
+			return
 		}
 		// 处理请求
 		if c.Request.Method != "GET" && c.Request.Method != "POST" {
@@ -272,12 +368,14 @@ func (s *webServer) DoReLogin() { // TODO: 协议层的 ReLogin
 	log.Info("开始尝试登录并同步消息...")
 	log.Infof("使用协议: %v", func() string {
 		switch client.SystemDeviceInfo.Protocol {
-		case client.AndroidPad:
-			return "Android Pad"
+		case client.IPad:
+			return "iPad"
 		case client.AndroidPhone:
 			return "Android Phone"
 		case client.AndroidWatch:
 			return "Android Watch"
+		case client.MacOS:
+			return "MacOS"
 		}
 		return "未知"
 	}())
@@ -291,8 +389,13 @@ func (s *webServer) DoReLogin() { // TODO: 协议层的 ReLogin
 			log.Debug("Protocol -> " + e.Message)
 		}
 	})
-	cli.OnServerUpdated(func(bot *client.QQClient, e *client.ServerUpdatedEvent) {
+	cli.OnServerUpdated(func(bot *client.QQClient, e *client.ServerUpdatedEvent) bool {
+		if !conf.UseSSOAddress {
+			log.Infof("收到服务器地址更新通知, 根据配置文件已忽略.")
+			return false
+		}
 		log.Infof("收到服务器地址更新通知, 将在下一次重连时应用. ")
+		return true
 	})
 	s.Cli = cli
 	s.Dologin()
@@ -340,11 +443,18 @@ func (s *webServer) ReloadServer() {
 
 // 热重启
 func AdminDoRestart(s *webServer, c *gin.Context) {
+	s.bot.Release()
 	s.bot = nil
 	s.Cli = nil
 	s.DoReLogin()
 	c.JSON(200, coolq.OK(coolq.MSG{}))
 	return
+}
+
+// 进程重启
+func AdminProcessRestart(s *webServer, c *gin.Context) {
+	Restart <- struct{}{}
+	c.JSON(200, coolq.OK(coolq.MSG{}))
 }
 
 // 冷重启
@@ -389,9 +499,9 @@ func AdminDoConfigBase(s *webServer, c *gin.Context) {
 		conf.EnableDB = false
 	}
 	conf.AccessToken = c.PostForm("access_token")
-	if err := conf.Save("config.json"); err != nil {
-		log.Fatalf("保存 config.json 时出现错误: %v", err)
-		c.JSON(200, Failed(502, "保存 config.json 时出现错误:"+fmt.Sprintf("%v", err)))
+	if err := conf.Save("config.hjson"); err != nil {
+		log.Fatalf("保存 config.hjson 时出现错误: %v", err)
+		c.JSON(200, Failed(502, "保存 config.hjson 时出现错误:"+fmt.Sprintf("%v", err)))
 	} else {
 		JsonConfig = nil
 		c.JSON(200, coolq.OK(coolq.MSG{}))
@@ -414,9 +524,9 @@ func AdminDoConfigHttp(s *webServer, c *gin.Context) {
 	if c.PostForm("post_url") != "" {
 		conf.HttpConfig.PostUrls[c.PostForm("post_url")] = c.PostForm("post_secret")
 	}
-	if err := conf.Save("config.json"); err != nil {
-		log.Fatalf("保存 config.json 时出现错误: %v", err)
-		c.JSON(200, Failed(502, "保存 config.json 时出现错误:"+fmt.Sprintf("%v", err)))
+	if err := conf.Save("config.hjson"); err != nil {
+		log.Fatalf("保存 config.hjson 时出现错误: %v", err)
+		c.JSON(200, Failed(502, "保存 config.hjson 时出现错误:"+fmt.Sprintf("%v", err)))
 	} else {
 		JsonConfig = nil
 		c.JSON(200, coolq.OK(coolq.MSG{}))
@@ -434,9 +544,9 @@ func AdminDoConfigWs(s *webServer, c *gin.Context) {
 	} else {
 		conf.WSConfig.Enabled = false
 	}
-	if err := conf.Save("config.json"); err != nil {
-		log.Fatalf("保存 config.json 时出现错误: %v", err)
-		c.JSON(200, Failed(502, "保存 config.json 时出现错误:"+fmt.Sprintf("%v", err)))
+	if err := conf.Save("config.hjson"); err != nil {
+		log.Fatalf("保存 config.hjson 时出现错误: %v", err)
+		c.JSON(200, Failed(502, "保存 config.hjson 时出现错误:"+fmt.Sprintf("%v", err)))
 	} else {
 		JsonConfig = nil
 		c.JSON(200, coolq.OK(coolq.MSG{}))
@@ -456,9 +566,9 @@ func AdminDoConfigReverse(s *webServer, c *gin.Context) {
 	} else {
 		conf.ReverseServers[0].Enabled = false
 	}
-	if err := conf.Save("config.json"); err != nil {
-		log.Fatalf("保存 config.json 时出现错误: %v", err)
-		c.JSON(200, Failed(502, "保存 config.json 时出现错误:"+fmt.Sprintf("%v", err)))
+	if err := conf.Save("config.hjson"); err != nil {
+		log.Fatalf("保存 config.hjson 时出现错误: %v", err)
+		c.JSON(200, Failed(502, "保存 config.hjson 时出现错误:"+fmt.Sprintf("%v", err)))
 	} else {
 		JsonConfig = nil
 		c.JSON(200, coolq.OK(coolq.MSG{}))
@@ -471,13 +581,13 @@ func AdminDoConfigJson(s *webServer, c *gin.Context) {
 	Json := c.PostForm("json")
 	err := json.Unmarshal([]byte(Json), &conf)
 	if err != nil {
-		log.Warnf("尝试加载配置文件 %v 时出现错误: %v", "config.json", err)
-		c.JSON(200, Failed(502, "保存 config.json 时出现错误:"+fmt.Sprintf("%v", err)))
+		log.Warnf("尝试加载配置文件 %v 时出现错误: %v", "config.hjson", err)
+		c.JSON(200, Failed(502, "保存 config.hjson 时出现错误:"+fmt.Sprintf("%v", err)))
 		return
 	}
-	if err := conf.Save("config.json"); err != nil {
-		log.Fatalf("保存 config.json 时出现错误: %v", err)
-		c.JSON(200, Failed(502, "保存 config.json 时出现错误:"+fmt.Sprintf("%v", err)))
+	if err := conf.Save("config.hjson"); err != nil {
+		log.Fatalf("保存 config.hjson 时出现错误: %v", err)
+		c.JSON(200, Failed(502, "保存 config.hjson 时出现错误:"+fmt.Sprintf("%v", err)))
 	} else {
 		JsonConfig = nil
 		c.JSON(200, coolq.OK(coolq.MSG{}))
