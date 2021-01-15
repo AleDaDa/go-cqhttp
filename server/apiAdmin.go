@@ -18,6 +18,7 @@ import (
 	"github.com/Mrs4s/MiraiGo/client"
 	"github.com/Mrs4s/go-cqhttp/coolq"
 	"github.com/Mrs4s/go-cqhttp/global"
+	"github.com/Mrs4s/go-cqhttp/qgroup"
 	"github.com/gin-gonic/gin"
 	jsoniter "github.com/json-iterator/go"
 	log "github.com/sirupsen/logrus"
