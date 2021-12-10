@@ -3,6 +3,7 @@ package qgroup
 import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"strings"
 )
 import "github.com/Mrs4s/go-cqhttp/coolq"
@@ -14,8 +15,8 @@ func (g *GroupRule) Listern(bot *coolq.CQBot) {
 	//g.bot.OnEventPush(g.onNewGroupMate)
 }
 
-func (g *GroupRule) OnNewUserRequest(m coolq.MSG) {
-
+func (g *GroupRule) OnNewUserRequest(e *coolq.Event) {
+	m := e.RawMsg
 	//"post_type":    "request",
 	//	"request_type": "group",
 	//	"sub_type":     "add",
@@ -39,7 +40,8 @@ func (g *GroupRule) OnNewUserRequest(m coolq.MSG) {
 	}
 }
 
-func (g *GroupRule) OnGroupMsg(m coolq.MSG) {
+func (g *GroupRule) OnGroupMsg(e *coolq.Event) {
+	m := e.RawMsg
 	if mType, ok := m["message_type"]; !ok || mType != "group" {
 		// 过滤非群组消息
 		return
@@ -61,7 +63,7 @@ func (g *GroupRule) OnGroupMsg(m coolq.MSG) {
 	if ans := g.checkQA(m["message"].(string)); ans != "" {
 		log.Infoln("匹配QA")
 		//匹配成功, 发消息
-		g.bot.CQSendGroupMessage(m["group_id"].(int64), ans, false)
+		g.bot.CQSendGroupMessage(m["group_id"].(int64), gjson.Result{Type: gjson.String, Str:ans}, false)
 		return
 	}
 	//m["user_id"]
@@ -69,33 +71,23 @@ func (g *GroupRule) OnGroupMsg(m coolq.MSG) {
 	//m["group_id"]
 }
 
-func (g *GroupRule) onNewGroupMate(m coolq.MSG) {
-	if m["post_type"] != "notice" {
-		return
-	}
-	fmt.Println("#11111")
-	if m["notice_type"] != "group_increase" {
-		return
-	}
-	fmt.Println("#2222222")
+// func (g *GroupRule) onNewGroupMate(m coolq.MSG) {
+// 	if m["post_type"] != "notice" {
+// 		return
+// 	}
+// 	fmt.Println("#11111")
+// 	if m["notice_type"] != "group_increase" {
+// 		return
+// 	}
+// 	fmt.Println("#2222222")
 
-	if m["sub_type"] == "approve" {
-		fmt.Println("new guy")
-		msg := fmt.Sprintf("欢迎@%d, 可以发送[ 攻略介绍 ]查看攻略信息 \n新手可以领取礼品码 xslb1  xslb2  xslp1  xslp2  fz001  fz002  88888888")
-		g.bot.CQSendGroupMessage(m["group_id"].(int64), msg, false)
-	}
+// 	if m["sub_type"] == "approve" {
+// 		fmt.Println("new guy")
+// 		msg := fmt.Sprintf("欢迎@%d, 可以发送[ 攻略介绍 ]查看攻略信息 \n新手可以领取礼品码 xslb1  xslb2  xslp1  xslp2  fz001  fz002  88888888")
+// 		g.bot.CQSendGroupMessage(m["group_id"].(int64), msg, false)
+// 	}
 
-	//return MSG{
-	//	"post_type":   "notice",
-	//	"notice_type": "group_increase",
-	//	"group_id":    groupCode,
-	//	"operator_id": operatorUin,
-	//	"self_id":     bot.Client.Uin,
-	//	"sub_type":    "approve",
-	//	"time":        time.Now().Unix(),
-	//	"user_id":     userUin,
-	//}
-}
+// }
 
 func (g *GroupRule) checkQA(msg string) string {
 	for q, idx := range g.BotQA.KeyMap {
