@@ -140,6 +140,14 @@ func (c *Caller) call(action string, p Getter) global.MSG {
 		return c.bot.CQGetGuildChannelList(p0, p1)
 	case "get_guild_list":
 		return c.bot.CQGetGuildList()
+	case "get_guild_member_list":
+		p0 := p.Get("guild_id").Uint()
+		p1 := p.Get("next_token").String()
+		return c.bot.CQGetGuildMembers(p0, p1)
+	case "get_guild_member_profile":
+		p0 := p.Get("guild_id").Uint()
+		p1 := p.Get("user_id").Uint()
+		return c.bot.CQGetGuildMemberProfile(p0, p1)
 	case "get_guild_meta_by_guest":
 		p0 := p.Get("guild_id").Uint()
 		return c.bot.CQGetGuildMetaByGuest(p0)
