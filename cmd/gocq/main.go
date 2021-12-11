@@ -6,13 +6,12 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"encoding/hex"
+	"github.com/Mrs4s/go-cqhttp/qgroup"
 	"os"
 	"path"
 	"sync"
 	"time"
 
-	"github.com/Mrs4s/MiraiGo/binary"
-	"github.com/Mrs4s/MiraiGo/client"
 	para "github.com/fumiama/go-hide-param"
 	rotatelogs "github.com/lestrrat-go/file-rotatelogs"
 	log "github.com/sirupsen/logrus"
@@ -337,7 +336,13 @@ func Main() {
 	}
 	cli.SetOnlineStatus(allowStatus[base.Account.Status])
 
-	servers.Run(coolq.NewQQBot(cli))
+	// servers.Run(coolq.NewQQBot(cli))
+	
+	myQABot := coolq.NewQQBot(cli)
+	servers.Run(myQABot)
+
+	qRule := qgroup.CreateNewRule("def")
+	qRule.Listern(myQABot)
 	log.Info("资源初始化完成, 开始处理信息.")
 	log.Info("アトリは、高性能ですから!")
 
