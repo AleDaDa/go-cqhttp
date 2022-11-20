@@ -28,6 +28,7 @@ require (
 require (
 	github.com/RomiChan/protobuf v0.1.1-0.20220624030127-3310cba9dbc0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+
 	github.com/fumiama/imgsz v0.0.2 // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
@@ -37,13 +38,16 @@ require (
 	github.com/lestrrat-go/strftime v1.0.5 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/pierrec/lz4/v4 v4.1.15 // indirect
+
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
+	github.com/ugorji/go/codec v1.1.7 // indirect
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
 	github.com/xdg-go/scram v1.0.2 // indirect
 	github.com/xdg-go/stringprep v1.0.2 // indirect
+
 	github.com/youmark/pkcs8 v0.0.0-20181117223130-1be2e3e5546d // indirect
 	golang.org/x/net v0.0.0-20211123203042-d83791d6bcd9 // indirect
 	golang.org/x/sync v0.0.0-20220819030929-7fc1605a5dde // indirect
@@ -52,4 +56,5 @@ require (
 	modernc.org/libc v1.8.1 // indirect
 	modernc.org/mathutil v1.2.2 // indirect
 	modernc.org/memory v1.0.4 // indirect
+
 )
